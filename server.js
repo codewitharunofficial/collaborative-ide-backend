@@ -45,6 +45,10 @@ io.on("connection", (socket) => {
 });
 
 
+app.use('/keep-alive', (req, res) => {
+    res.status(200).send({ status: 'ok' })
+});
+
 
 app.get('/', (req, res) => {
     res.send('Welcome To The Code Editor Backend Service');
