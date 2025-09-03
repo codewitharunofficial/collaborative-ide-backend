@@ -12,8 +12,13 @@ const app = express();
 app.use(cors());
 
 const PORT = 1234;
+const WORKSPACE_DIR = path.join(process.cwd(), "workspace");
 
 connectDB();
+
+if (!fs.existsSync(WORKSPACE_DIR)) {
+    fs.mkdirSync(WORKSPACE_DIR);
+}
 
 const httpServer = app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
@@ -22,6 +27,22 @@ const httpServer = app.listen(PORT, () => {
 const io = new Server(httpServer, {
     cors: { origin: "*", methods: ["GET", "POST"] },
 });
+
+// Helper: build file tree
+function buildFileTree(dirPath) {
+    return fs.readdirSync(dirPath).map((file) => {
+        const fullPath = path.join(dirPath, file);
+        const stats = fs.statSync(fullPath);
+        if (stats.isDirectory()) {
+            return {
+                name: file,
+                type: "folder",
+                children: buildFileTree(fullPath),
+            };
+        }
+        return { name: file, type: "file" };
+    });
+}
 
 io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
@@ -54,39 +75,34 @@ io.on("connection", (socket) => {
         socket.emit("room-created", { success: true });
     });
 
-
     socket.on("join-room", ({ roomId }) => {
         socket.join(roomId);
         console.log(`User ${socket.id} joined room ${roomId}`);
         socket.emit("room-joined", { success: true });
     });
 
-  
     socket.on("code-change", ({ roomId, code }) => {
         console.log(`Code update in ${roomId} from ${socket.id}`);
         socket.to(roomId).emit("code-update", code);
     });
-
 
     socket.on("language-change", ({ roomId, language }) => {
         console.log(`Language changed to ${language} in ${roomId}`);
         io.to(roomId).emit("language-update", language);
     });
 
-
     socket.on("terminal-command", ({ roomId, command }) => {
         console.log(`Command from ${socket.id} in ${roomId}: ${command}`);
-        exec(command, { timeout: 5000 }, (err, stdout, stderr) => {
+        exec(command, { cwd: WORKSPACE_DIR, timeout: 5000 }, (err, stdout, stderr) => {
             const output = stdout || stderr || (err ? err.message : "No output");
             io.to(roomId).emit("terminal-output", { command, output });
         });
     });
 
-
     socket.on("run-js", ({ roomId, code }) => {
         console.log(`Running JS code in ${roomId} from ${socket.id}`);
 
-        const filePath = path.join(process.cwd(), `temp-${Date.now()}.js`);
+        const filePath = path.join(WORKSPACE_DIR, `temp-${Date.now()}.js`);
         fs.writeFileSync(filePath, code);
 
         exec(`node "${filePath}"`, { timeout: 5000 }, (err, stdout, stderr) => {
@@ -97,11 +113,55 @@ io.on("connection", (socket) => {
                 output,
             });
 
-            // cleanup temp file
             fs.unlink(filePath, (unlinkErr) => {
                 if (unlinkErr) console.error("Cleanup error:", unlinkErr.message);
             });
         });
+    });
+
+    // Clone GitHub repo
+    socket.on("clone-repo", ({ roomId, repoUrl }) => {
+        console.log(`Cloning repo for room ${roomId}: ${repoUrl}`);
+
+        const repoPath = path.join(WORKSPACE_DIR, roomId);
+
+        // Remove old repo if exists
+        if (fs.existsSync(repoPath)) {
+            fs.rmSync(repoPath, { recursive: true, force: true });
+        }
+
+        exec(`git clone ${repoUrl} "${repoPath}"`, (err, stdout, stderr) => {
+            if (err) {
+                console.error("Clone error:", stderr);
+                socket.emit("terminal-output", {
+                    command: `git clone ${repoUrl}`,
+                    output: stderr || err.message,
+                });
+                return;
+            }
+
+            console.log("Repo cloned successfully:", repoPath);
+            const fileTree = buildFileTree(repoPath);
+            io.to(roomId).emit("repo-files", fileTree);
+
+            socket.emit("terminal-output", {
+                command: `git clone ${repoUrl}`,
+                output: "✅ Repository cloned successfully",
+            });
+        });
+    });
+
+    // Open file from repo
+    socket.on("open-file", ({ roomId, filePath }) => {
+        const repoPath = path.join(WORKSPACE_DIR, roomId, filePath);
+
+        if (!fs.existsSync(repoPath)) {
+            socket.emit("file-content", { filePath, content: "// File not found" });
+            return;
+        }
+
+        const content = fs.readFileSync(repoPath, "utf-8");
+        socket.emit("file-content", { filePath, content });
     });
 
     socket.on("disconnect", () => {
