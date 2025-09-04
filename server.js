@@ -7,18 +7,14 @@ import path from "path";
 import connectDB from "./DB/mongoDB.js";
 import "dotenv/config";
 import User from "./Models/User.js";
+import Project from "./Models/Project.js";
 
 const app = express();
 app.use(cors());
 
 const PORT = 1234;
-const WORKSPACE_DIR = path.join(process.cwd(), "workspace");
 
 connectDB();
-
-if (!fs.existsSync(WORKSPACE_DIR)) {
-    fs.mkdirSync(WORKSPACE_DIR);
-}
 
 const httpServer = app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
@@ -28,47 +24,60 @@ const io = new Server(httpServer, {
     cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
-// Helper: build file tree
-function buildFileTree(dirPath) {
-    return fs.readdirSync(dirPath).map((file) => {
-        const fullPath = path.join(dirPath, file);
-        const stats = fs.statSync(fullPath);
-        if (stats.isDirectory()) {
-            return {
+// ✅ Recursive file tree builder
+const buildFileTree = (dir, base = dir) => {
+    const items = [];
+    if (!fs.existsSync(dir)) return items;
+
+    const files = fs.readdirSync(dir);
+    for (let file of files) {
+        const fullPath = path.join(dir, file);
+        const stat = fs.statSync(fullPath);
+
+        if (stat.isDirectory()) {
+            items.push({
                 name: file,
+                path: path.relative(base, fullPath),
                 type: "folder",
-                children: buildFileTree(fullPath),
-            };
+                children: buildFileTree(fullPath, base),
+            });
+        } else {
+            items.push({
+                name: file,
+                path: path.relative(base, fullPath),
+                type: "file",
+            });
         }
-        return { name: file, type: "file" };
-    });
-}
+    }
+    return items;
+};
 
 io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
+    // ✅ user auth
     socket.on("user-auth", async ({ user, expiresAt }) => {
         if (user && user.email) {
-            const theUser = await User.findOne({ email: user?.email });
+            let theUser = await User.findOne({ email: user?.email });
 
             if (!theUser) {
                 console.log("No Such User In DB");
-                const newUser = new User({
+                theUser = new User({
                     name: user?.name,
                     email: user?.email,
                     picture: user?.image,
                     expiresAt,
                 });
-                await newUser.save();
-
-                socket.emit("successful-auth", { user: newUser });
+                await theUser.save();
             } else {
                 console.log("User already exists in DB");
-                socket.emit("successful-auth", { user: theUser });
             }
+
+            socket.emit("successful-auth", { user: theUser });
         }
     });
 
+    // ✅ rooms
     socket.on("create-room", ({ roomId }) => {
         socket.join(roomId);
         console.log(`Room created: ${roomId} by ${socket.id}`);
@@ -81,28 +90,26 @@ io.on("connection", (socket) => {
         socket.emit("room-joined", { success: true });
     });
 
+    // ✅ code sync
     socket.on("code-change", ({ roomId, code }) => {
-        console.log(`Code update in ${roomId} from ${socket.id}`);
         socket.to(roomId).emit("code-update", code);
     });
 
     socket.on("language-change", ({ roomId, language }) => {
-        console.log(`Language changed to ${language} in ${roomId}`);
         io.to(roomId).emit("language-update", language);
     });
 
+    // ✅ terminal commands
     socket.on("terminal-command", ({ roomId, command }) => {
-        console.log(`Command from ${socket.id} in ${roomId}: ${command}`);
-        exec(command, { cwd: WORKSPACE_DIR, timeout: 5000 }, (err, stdout, stderr) => {
+        exec(command, { timeout: 5000 }, (err, stdout, stderr) => {
             const output = stdout || stderr || (err ? err.message : "No output");
             io.to(roomId).emit("terminal-output", { command, output });
         });
     });
 
+    // ✅ run JS code
     socket.on("run-js", ({ roomId, code }) => {
-        console.log(`Running JS code in ${roomId} from ${socket.id}`);
-
-        const filePath = path.join(WORKSPACE_DIR, `temp-${Date.now()}.js`);
+        const filePath = path.join(process.cwd(), `temp-${Date.now()}.js`);
         fs.writeFileSync(filePath, code);
 
         exec(`node "${filePath}"`, { timeout: 5000 }, (err, stdout, stderr) => {
@@ -119,49 +126,69 @@ io.on("connection", (socket) => {
         });
     });
 
-    // Clone GitHub repo
-    socket.on("clone-repo", ({ roomId, repoUrl }) => {
-        console.log(`Cloning repo for room ${roomId}: ${repoUrl}`);
-
-        const repoPath = path.join(WORKSPACE_DIR, roomId);
-
-        // Remove old repo if exists
-        if (fs.existsSync(repoPath)) {
-            fs.rmSync(repoPath, { recursive: true, force: true });
+    // ✅ clone repo & save to DB
+    socket.on("clone-repo", async ({ roomId, repoUrl, email }) => {
+        if (!repoUrl || !email) {
+            socket.emit("terminal-output", {
+                command: "git clone",
+                output: "❌ Repo URL and email are required",
+            });
+            return;
         }
 
-        exec(`git clone ${repoUrl} "${repoPath}"`, (err, stdout, stderr) => {
+        const projectName = repoUrl.split("/").pop().replace(".git", "");
+        const projectPath = path.join(process.cwd(), "projects", email, projectName);
+
+        // Check DB first
+        let project = await Project.findOne({ repoUrl, email: email });
+
+        if (project) {
+            console.log("✅ Found project in DB, sending cached files.");
+            io.to(roomId).emit("project-loaded", { project, files: project.files });
+            return;
+        }
+
+        console.log(`Cloning repo: ${repoUrl} into ${projectPath}`);
+
+        exec(`git clone ${repoUrl} ${projectPath}`, async (err) => {
             if (err) {
-                console.error("Clone error:", stderr);
-                socket.emit("terminal-output", {
-                    command: `git clone ${repoUrl}`,
-                    output: stderr || err.message,
+                io.to(roomId).emit("terminal-output", {
+                    command: "git clone",
+                    output: `❌ Failed to clone repo: ${err.message}`,
                 });
                 return;
             }
 
-            console.log("Repo cloned successfully:", repoPath);
-            const fileTree = buildFileTree(repoPath);
-            io.to(roomId).emit("repo-files", fileTree);
+            // build file tree
+            const fileTree = buildFileTree(projectPath);
 
-            socket.emit("terminal-output", {
-                command: `git clone ${repoUrl}`,
-                output: "✅ Repository cloned successfully",
+            // save project
+            project = new Project({
+                email: email,
+                name: projectName,
+                repoUrl,
+                path: projectPath,
+                files: fileTree,
             });
+            await project.save();
+
+            console.log("✅ Repo cloned & saved:", project.name);
+
+            io.to(roomId).emit("project-loaded", { project, files: fileTree });
         });
     });
 
-    // Open file from repo
-    socket.on("open-file", ({ roomId, filePath }) => {
-        const repoPath = path.join(WORKSPACE_DIR, roomId, filePath);
-
-        if (!fs.existsSync(repoPath)) {
-            socket.emit("file-content", { filePath, content: "// File not found" });
-            return;
+    // ✅ fetch projects from DB
+    socket.on("get-projects", async ({ email }) => {
+        try {
+            const projects = await Project.find({ userId: email });
+            socket.emit("projects-list", projects);
+        } catch (err) {
+            socket.emit("terminal-output", {
+                command: "get-projects",
+                output: `❌ Failed to fetch projects: ${err.message}`,
+            });
         }
-
-        const content = fs.readFileSync(repoPath, "utf-8");
-        socket.emit("file-content", { filePath, content });
     });
 
     socket.on("disconnect", () => {
