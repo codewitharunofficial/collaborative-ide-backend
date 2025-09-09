@@ -24,13 +24,18 @@ const io = new Server(httpServer, {
     cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
-// ✅ Recursive file tree builder
+// ✅ Recursive file tree builder (with file contents)
 const buildFileTree = (dir, base = dir) => {
     const items = [];
     if (!fs.existsSync(dir)) return items;
 
     const files = fs.readdirSync(dir);
     for (let file of files) {
+        // Skip heavy/unnecessary directories
+        if (["node_modules", ".git", ".next", "dist", "build"].includes(file)) {
+            continue;
+        }
+
         const fullPath = path.join(dir, file);
         const stat = fs.statSync(fullPath);
 
@@ -42,15 +47,34 @@ const buildFileTree = (dir, base = dir) => {
                 children: buildFileTree(fullPath, base),
             });
         } else {
+            // Decide whether to include content
+            const ext = path.extname(file).toLowerCase();
+            const textFileExts = [
+                ".js", ".ts", ".jsx", ".tsx",
+                ".json", ".md", ".html", ".css", ".txt"
+            ];
+
+            let content = "";
+            if (textFileExts.includes(ext) && stat.size < 1024 * 500) { // only if < 500KB
+                try {
+                    content = fs.readFileSync(fullPath, "utf-8");
+                } catch (err) {
+                    console.error("Error reading file:", fullPath, err.message);
+                }
+            }
+
             items.push({
                 name: file,
                 path: path.relative(base, fullPath),
                 type: "file",
+                content, // ✅ save content only for text-based files
             });
         }
     }
     return items;
 };
+
+
 
 io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
@@ -80,13 +104,11 @@ io.on("connection", (socket) => {
     // ✅ rooms
     socket.on("create-room", ({ roomId }) => {
         socket.join(roomId);
-        console.log(`Room created: ${roomId} by ${socket.id}`);
         socket.emit("room-created", { success: true });
     });
 
     socket.on("join-room", ({ roomId }) => {
         socket.join(roomId);
-        console.log(`User ${socket.id} joined room ${roomId}`);
         socket.emit("room-joined", { success: true });
     });
 
@@ -105,6 +127,31 @@ io.on("connection", (socket) => {
             const output = stdout || stderr || (err ? err.message : "No output");
             io.to(roomId).emit("terminal-output", { command, output });
         });
+    });
+
+    socket.on("get-file-content", ({ projectPath, relativePath }) => {
+        try {
+            const fullPath = path.join(projectPath, relativePath);
+            if (fs.existsSync(fullPath)) {
+                const content = fs.readFileSync(fullPath, "utf-8");
+                socket.emit("file-content", { path: relativePath, content });
+            } else {
+                socket.emit("file-content", { path: relativePath, content: "❌ File not found" });
+            }
+        } catch (err) {
+            socket.emit("file-content", { path: relativePath, content: `❌ Error: ${err.message}` });
+        }
+    });
+
+
+    socket.on("save-file", async ({ projectPath, relativePath, content }) => {
+        try {
+            const fullPath = path.join(projectPath, relativePath);
+            fs.writeFileSync(fullPath, content, "utf-8");
+            socket.emit("file-saved", { path: relativePath, success: true });
+        } catch (err) {
+            socket.emit("file-saved", { path: relativePath, success: false, error: err.message });
+        }
     });
 
     // ✅ run JS code
@@ -126,7 +173,7 @@ io.on("connection", (socket) => {
         });
     });
 
-    // ✅ clone repo & save to DB
+    // ✅ clone repo & save to DB (with file contents)
     socket.on("clone-repo", async ({ roomId, repoUrl, email }) => {
         if (!repoUrl || !email) {
             socket.emit("terminal-output", {
@@ -140,8 +187,7 @@ io.on("connection", (socket) => {
         const projectPath = path.join(process.cwd(), "projects", email, projectName);
 
         // Check DB first
-        let project = await Project.findOne({ repoUrl, email: email });
-
+        let project = await Project.findOne({ repoUrl, email });
         if (project) {
             console.log("✅ Found project in DB, sending cached files.");
             io.to(roomId).emit("project-loaded", { project, files: project.files });
@@ -159,12 +205,12 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // build file tree
+            // build file tree with contents
             const fileTree = buildFileTree(projectPath);
 
             // save project
             project = new Project({
-                email: email,
+                email,
                 name: projectName,
                 repoUrl,
                 path: projectPath,
@@ -181,7 +227,7 @@ io.on("connection", (socket) => {
     // ✅ fetch projects from DB
     socket.on("get-projects", async ({ email }) => {
         try {
-            const projects = await Project.find({ userId: email });
+            const projects = await Project.find({ email });
             socket.emit("projects-list", projects);
         } catch (err) {
             socket.emit("terminal-output", {
