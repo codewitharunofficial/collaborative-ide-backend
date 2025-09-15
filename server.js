@@ -79,7 +79,6 @@ const buildFileTree = (dir, base = dir) => {
 io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
-    // ✅ user auth
     socket.on("user-auth", async ({ user, expiresAt }) => {
         if (user && user.email) {
             let theUser = await User.findOne({ email: user?.email });
